@@ -135,7 +135,8 @@ union pte_entry_t
     uint64_t g:1;
     uint64_t unused2:3;
     uint64_t addr:40;
-    uint64_t unused1:7; // used by software
+    uint64_t ce_priority:6; // not used by hardware
+    uint64_t ce_pending:1; // not used by hardware
     uint64_t protkey:4;
     uint64_t xd:1;
   } data;
@@ -414,7 +415,7 @@ void pte_t::start_sync(const std::function<void(pte_entry_t *)> &func)
 {
   for (auto &entry : m_entry)
     if (entry && entry.data.d)
-      func(&entry), entry.data.rw = entry.data.a = entry.data.d = false;
+      func(&entry), entry.data.a = entry.data.d = false;
 }
 
 pgd_t::~pgd_t(void)
@@ -465,10 +466,11 @@ static void finish_pending_commands(uint64_t time)
       break;
 
     auto pte = ce_cmds[curr_priority][curr_index++];
-    if (pte->data.rw == false) {
-      // printf("(%lu) CE: Transfered one page (priority %lu)\n", ce_time, pte->data.unused1);
+    if (pte->data.ce_pending) {
+      // printf("(%lu) CE: Transfered one page (priority %lu)\n", ce_time, pte->data.ce_priority);
 
       pte->data.rw = true;
+      pte->data.ce_pending = false;
       ce_time += SYNC_DURATION_NS;
     }
   }
@@ -491,22 +493,67 @@ struct trace_t
   uint64_t time;
 };
 
-static uint64_t pause_time;
-static uint32_t checkpoint_id;
+static uint64_t last_cpt_time, cpt_interval, pre_cpt_time;
+static size_t last_copy_num;
+static std::vector<size_t> block_num, pre_copy_num, delayed_copy_num, post_copy_num;
 
 static void process_checkpoint(const trace_t &trace)
 {
-  assert(!~curr_priority);
+  static uint32_t checkpoint_id = 0;
 
-  for (auto &cmds : ce_cmds)
-    cmds.clear();
-  pgd->start_sync([] (pte_entry_t *pte) {
-      assert(pte->data.unused1 < PRIORITY_NUM);
-      ce_cmds[pte->data.unused1].push_back(pte);
+  assert(!~curr_priority || curr_priority == 0);
+  if (curr_priority == 0) {
+    std::vector<pte_entry_t *> old_cmds = std::move(ce_cmds[0]);
+    for (auto &cmds : ce_cmds)
+      cmds.clear();
+
+    for (size_t i = curr_index;i < old_cmds.size();++i)
+    {
+      auto pte = old_cmds[i];
+      assert(pte->data.ce_pending && pte->data.rw);
+      assert(pte->data.ce_priority < PRIORITY_NUM);
+
+      pte->data.a = pte->data.d = false;
+      pte->data.rw = false;
+      ce_cmds[pte->data.ce_priority].push_back(pte);
+    }
+    delayed_copy_num.push_back(old_cmds.size() - curr_index);
+  } else {
+    delayed_copy_num.push_back(0);
+    for (auto &cmds : ce_cmds)
+      cmds.clear();
+  }
+
+  cpt_interval = trace.time - last_cpt_time;
+  last_cpt_time = trace.time;
+  if (last_copy_num) {
+    pre_cpt_time = trace.time + cpt_interval;
+    pre_cpt_time -= SYNC_DURATION_NS * last_copy_num * 3 / 2;
+  } else {
+    pre_cpt_time = ~0ull;
+  }
+
+  block_num.push_back(0);
+  post_copy_num.push_back(0);
+  auto &cnt = post_copy_num[post_copy_num.size() - 1];
+
+  pgd->start_sync([&cnt] (pte_entry_t *pte) {
+      assert(pte->data.ce_priority < PRIORITY_NUM);
+      pte->data.rw = false;
+      pte->data.ce_pending = true;
+      ce_cmds[pte->data.ce_priority].push_back(pte);
+      ++cnt;
     });
   curr_priority = PRIORITY_NUM - 1;
   curr_index = 0;
   ce_time = trace.time;
+
+  if (pre_copy_num.size() == post_copy_num.size()) {
+    last_copy_num = pre_copy_num[pre_copy_num.size() - 1];
+  } else {
+    pre_copy_num.push_back(0);
+    last_copy_num = cnt;
+  }
 
   ++checkpoint_id;
   printf("(%lu) OS: Checkpoint #%u\n", trace.time, checkpoint_id);
@@ -517,17 +564,38 @@ static inline void adjust_page_priority(unsigned int priority)
   assert(priority >= 1);
 
   for (auto pte : ce_cmds[priority])
-    if (!pte->data.d && pte->data.unused1 == priority)
-      --pte->data.unused1;
+    if (!pte->data.d && pte->data.ce_priority == priority)
+      --pte->data.ce_priority;
 }
 
 static void process_memory_write(const trace_t &trace)
 {
-  static unsigned int priority_waiting = 0;
+  static unsigned int priority_waiting = ~0;
+
+#if 1 // with or without pre-CPT
+  if (trace.time >= pre_cpt_time) {
+    assert(!~priority_waiting);
+    assert(!~curr_priority); // TODO: It can be false.
+
+    pre_copy_num.push_back(0);
+    auto &cnt = pre_copy_num[pre_copy_num.size() - 1];
+
+    ce_cmds[0].clear();
+    pgd->start_sync([&cnt] (pte_entry_t *pte) {
+        pte->data.ce_pending = true;
+        ce_cmds[0].push_back(pte);
+        ++cnt;
+      });
+    ce_time = pre_cpt_time;
+    curr_priority = 0;
+    curr_index = 0;
+    pre_cpt_time = ~0ull;
+  }
+#endif
 
   finish_pending_commands(trace.time);
   while (~priority_waiting && priority_waiting != curr_priority)
-  {
+  {  // FIXME: Too frequent checkpoints may cause bugs here.
     if (priority_waiting != PRIORITY_NUM - 1)
       adjust_page_priority(priority_waiting + 1);
     --priority_waiting;
@@ -537,19 +605,21 @@ static void process_memory_write(const trace_t &trace)
   bool ok = pgd->access_write(trace.addr, &pte);
   if (ok)
     return;
+  assert(block_num.size() > 0);
+  ++block_num[block_num.size() - 1];
 
   pte->data.rw = true;
-  pause_time += SYNC_DURATION_NS;
   ok = pgd->access_write(trace.addr);
   assert(ok);
 
-  printf("(%lu) PF: Waiting for %lx (priority %lu)...\n", trace.time, trace.addr, pte->data.unused1);
+  printf("(%lu) PF: Waiting for %lx (priority %lu)...\n",
+            trace.time, trace.addr, pte->data.ce_priority);
 
   priority_waiting = curr_priority;
   for (unsigned int pr = curr_priority + 2;pr < PRIORITY_NUM;++pr)
     adjust_page_priority(pr);
-  if (pte->data.unused1 != PRIORITY_NUM - 1)
-    ++pte->data.unused1;
+  if (pte->data.ce_priority != PRIORITY_NUM - 1)
+    ++pte->data.ce_priority;
 }
 
 static void trace_processing(void)
@@ -579,6 +649,7 @@ static void trace_processing(void)
       process_memory_write(trace);
       break;
     case trace_t::EXIT:
+      printf("(%lu) OS: Exiting...\n", trace.time);
       goto out;
     }
   }
@@ -591,6 +662,21 @@ out:
 int main(void)
 {
   trace_processing();
+
+#define PRINT_VECTOR(vec) \
+  ({ \
+    printf(#vec " = ["); \
+    for (size_t _s : vec) \
+      printf("%lu, ", _s); \
+    printf("]\n"); \
+   })
+
+  PRINT_VECTOR(block_num);
+  PRINT_VECTOR(pre_copy_num);
+  PRINT_VECTOR(post_copy_num);
+  PRINT_VECTOR(delayed_copy_num);
+
+#undef PRINT_VECTOR
 
   return 0;
 }
